@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yeoboseyo-server
+    environment:
+      # HTTP server
+      - PORT=8080
+
+      # Google OAuth
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GOOGLE_REDIRECT_URL=${GOOGLE_REDIRECT_URL:-http://localhost:8080/auth/google/callback}
+
+      # JWT
+      - JWT_SECRET=${JWT_SECRET:-dev-secret-change-me}
+
+      # Database (на будущее, когда появится подключение к БД в коде)
+      - DATABASE_URL=postgres://yeo_user:yeo_pass@db:5432/yeo_db?sslmode=disable
+
+    depends_on:
+      - db
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: yeoboseyo-postgres
+    environment:
+      - POSTGRES_DB=yeo_db
+      - POSTGRES_USER=yeo_user
+      - POSTGRES_PASSWORD=yeo_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  db_data:
