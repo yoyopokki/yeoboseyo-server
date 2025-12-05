@@ -13,6 +13,9 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"github.com/rs/zerolog/log"
+
+	"github.com/yeoboseyo/server/internal/db"
 )
 
 var googleOAuthConfig *oauth2.Config
@@ -45,7 +48,7 @@ func GoogleLoginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // GoogleCallbackHandler: получает код, обменивает на токен и возвращает базовый профиль
-// На практике здесь нужно искать/создавать пользователя в БД и выдавать свой JWT/сессию.
+// Ищет/создаёт пользователя в БД и выдаёт свой JWT/сессию.
 func GoogleCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	if code == "" {
@@ -59,11 +62,64 @@ func GoogleCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Заглушка: в реальном коде вытаскиваем профиль через Google API.
-	resp := map[string]any{
-		"access_token": token.AccessToken,
-		"token_type":   token.TokenType,
-		"expires_in":   token.Expiry,
+	// Получаем информацию о пользователе из Google API
+	userInfo, err := fetchGoogleUserInfo(r.Context(), token.AccessToken)
+	if err != nil {
+		http.Error(w, "failed to fetch user info: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Ищем или создаём пользователя в БД
+	pool := DB()
+	if pool == nil {
+		http.Error(w, "database not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	dbUser, isNew, err := db.GetOrCreateUser(
+		r.Context(),
+		pool,
+		userInfo.Subject,
+		userInfo.Email,
+		userInfo.Name,
+		userInfo.Picture,
+	)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get or create user")
+		http.Error(w, "failed to process user: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Создаём СВОЙ JWT с user_id из БД
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"user_id": dbUser.ID,
+		"email":   dbUser.Email,
+		"exp":     now.Add(24 * time.Hour).Unix(),
+		"iat":     now.Unix(),
+	}
+
+	jwtToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := jwtToken.SignedString(jwtSecret)
+	if err != nil {
+		http.Error(w, "failed to sign jwt", http.StatusInternalServerError)
+		return
+	}
+
+	resp := frontendGoogleAuthResponse{
+		Token: signed,
+		User: googleUserInfo{
+			Sub:     dbUser.GoogleID,
+			Email:   dbUser.Email,
+			Name:    dbUser.Name,
+			Picture: dbUser.Picture,
+		},
+	}
+
+	if isNew {
+		log.Info().Int64("user_id", dbUser.ID).Str("email", dbUser.Email).Msg("new user registered")
+	} else {
+		log.Info().Int64("user_id", dbUser.ID).Str("email", dbUser.Email).Msg("user logged in")
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -120,15 +176,32 @@ func GoogleFrontendAuthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Здесь в реальном проекте: ищем/создаём пользователя в БД по info.Subject (google_id) / info.Email.
-	// Допустим, что userID == info.Subject (google sub) — заглушка вместо БД.
-	userID := info.Subject
+	// Ищем или создаём пользователя в БД
+	pool := DB()
+	if pool == nil {
+		http.Error(w, "database not initialized", http.StatusInternalServerError)
+		return
+	}
 
-	// Создаём СВОЙ JWT с user_id
+	dbUser, isNew, err := db.GetOrCreateUser(
+		r.Context(),
+		pool,
+		info.Subject,
+		info.Email,
+		info.Name,
+		info.Picture,
+	)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get or create user")
+		http.Error(w, "failed to process user: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Создаём СВОЙ JWT с user_id из БД
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"user_id": userID,
-		"email":   info.Email,
+		"user_id": dbUser.ID,
+		"email":   dbUser.Email,
 		"exp":     now.Add(24 * time.Hour).Unix(),
 		"iat":     now.Unix(),
 	}
@@ -143,11 +216,17 @@ func GoogleFrontendAuthHandler(w http.ResponseWriter, r *http.Request) {
 	resp := frontendGoogleAuthResponse{
 		Token: signed,
 		User: googleUserInfo{
-			Sub:     info.Subject,
-			Email:   info.Email,
-			Name:    info.Name,
-			Picture: info.Picture,
+			Sub:     dbUser.GoogleID,
+			Email:   dbUser.Email,
+			Name:    dbUser.Name,
+			Picture: dbUser.Picture,
 		},
+	}
+
+	if isNew {
+		log.Info().Int64("user_id", dbUser.ID).Str("email", dbUser.Email).Msg("new user registered")
+	} else {
+		log.Info().Int64("user_id", dbUser.ID).Str("email", dbUser.Email).Msg("user logged in")
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -188,6 +267,45 @@ func verifyGoogleIDToken(ctx context.Context, idToken string) (*googleTokenInfo,
 	}
 
 	return &info, nil
+}
+
+// fetchGoogleUserInfo получает информацию о пользователе из Google API используя access_token
+func fetchGoogleUserInfo(ctx context.Context, accessToken string) (*googleTokenInfo, error) {
+	url := "https://www.googleapis.com/oauth2/v2/userinfo?access_token=" + accessToken
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("google userinfo status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var userInfo struct {
+		ID      string `json:"id"`
+		Email   string `json:"email"`
+		Name    string `json:"name"`
+		Picture string `json:"picture"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		return nil, err
+	}
+
+	// Преобразуем в формат googleTokenInfo для совместимости
+	return &googleTokenInfo{
+		Subject: userInfo.ID,
+		Email:   userInfo.Email,
+		Name:    userInfo.Name,
+		Picture: userInfo.Picture,
+	}, nil
 }
 
 

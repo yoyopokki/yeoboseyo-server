@@ -30,6 +30,11 @@ func main() {
 	}
 	defer pool.Close()
 
+	// Выполняем миграции
+	if err := db.RunMigrations(ctx, pool); err != nil {
+		zlog.Fatal().Err(err).Msg("failed to run migrations")
+	}
+
 	// Прокидываем пул в httpapi-пакет для использования в хендлерах.
 	httpapi.SetDB(pool)
 
